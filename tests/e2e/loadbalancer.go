@@ -16,6 +16,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -92,6 +93,7 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 		// Flags to override default test behavior.
 		overrideTestRunInClusterReachableHTTP bool
 		requireAffinity                       bool
+		requiresIPv4                          bool
 
 		// Test verification
 		skipTestFailure bool
@@ -131,6 +133,7 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 		{
 			name:           "CLB internal should be reachable with hairpinning traffic",
 			resourceSuffix: "hp-clb-int",
+			requiresIPv4:   true,
 			extraAnnotations: map[string]string{
 				annotationLBInternal: "true",
 			},
@@ -151,6 +154,7 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 		{
 			name:           "NLB internal should be reachable with hairpinning traffic",
 			resourceSuffix: "hp-nlb-int",
+			requiresIPv4:   true,
 			extraAnnotations: map[string]string{
 				annotationLBType:                  "nlb",
 				annotationLBInternal:              "true",
@@ -255,7 +259,11 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			e2e := newE2eTestConfig(cs)
 			e2e.discoverClusterWorkerNode()
 			framework.Logf("[SETUP] Test case: %s", tc.name)
-			framework.Logf("[SETUP] Worker nodes discovered: %d nodes, selector: %s, sample node: %s", e2e.nodeCount, e2e.nodeSelector, e2e.nodeSingleSample)
+			framework.Logf("[SETUP] Worker nodes discovered: %d nodes, selector: %s, sample node: %s, hasIPv4: %t, hasIPv6: %t",
+				e2e.nodeCount, e2e.nodeSelector, e2e.nodeSingleSample, e2e.hasIPv4Nodes, e2e.hasIPv6Nodes)
+			if tc.requiresIPv4 && !e2e.hasIPv4Nodes {
+				Skip(fmt.Sprintf("skipping %q: test requires IPv4 nodes, but none were found in the cluster", tc.name))
+			}
 
 			loadBalancerCreateTimeout := e2eservice.GetServiceLoadBalancerCreationTimeout(ctx, cs)
 			framework.Logf("[CONFIG] AWS load balancer timeout: %s", loadBalancerCreateTimeout)
@@ -423,6 +431,8 @@ type e2eTestConfig struct {
 	nodeSelector     string
 	nodeCount        int
 	nodeSingleSample string
+	hasIPv4Nodes     bool
+	hasIPv6Nodes     bool
 }
 
 func newE2eTestConfig(cs clientset.Interface) *e2eTestConfig {
@@ -591,6 +601,18 @@ func (e2e *e2eTestConfig) discoverClusterWorkerNode() {
 					continue
 				}
 				workerNodeList = append(workerNodeList, node.Name)
+				for _, addr := range node.Status.Addresses {
+					if addr.Type == v1.NodeInternalIP {
+						ip := net.ParseIP(addr.Address)
+						if ip != nil {
+							if ip.To4() != nil {
+								e2e.hasIPv4Nodes = true
+							} else {
+								e2e.hasIPv6Nodes = true
+							}
+						}
+					}
+				}
 			}
 			// Save the first worker node in the list to be used in cases.
 			sort.Strings(workerNodeList)
