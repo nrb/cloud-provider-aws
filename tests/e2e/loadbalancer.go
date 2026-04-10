@@ -94,6 +94,7 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 		overrideTestRunInClusterReachableHTTP bool
 		requireAffinity                       bool
 		requiresIPv4                          bool
+		requiresDualStack                     bool
 
 		// Test verification
 		skipTestFailure bool
@@ -250,6 +251,113 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				}
 			},
 		},
+		// Hairpinning traffic test for NLB on dual-stack clusters.
+		// Identical to the IPv4-only NLB hairpin test except the Service is explicitly
+		// configured as dual-stack (IPv6-primary) so that the NLB supports both address
+		// families.  Without setting ipFamilyPolicy and ipFamilies, the default on a
+		// dual-stack cluster may produce a single-stack service that NLBs reject.
+		{
+			name:              "NLB internal should be reachable with hairpinning traffic on dual stack clusters",
+			resourceSuffix:    "hp-nlb-int-ds",
+			requiresDualStack: true,
+			extraAnnotations: map[string]string{
+				annotationLBType:                  "nlb",
+				annotationLBInternal:              "true",
+				annotationLBTargetGroupAttributes: "preserve_client_ip.enabled=false",
+			},
+			listenerCount:                         1,
+			overrideTestRunInClusterReachableHTTP: true,
+			requireAffinity:                       true,
+			hookPostServiceConfig: func(cfg *e2eTestConfig) {
+				framework.Logf("running hook post-service-config patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+				if cfg.svc.Annotations == nil {
+					cfg.svc.Annotations = map[string]string{}
+				}
+				cfg.svc.Annotations[annotationLBTargetNodeLabels] = fmt.Sprintf("kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+				ipFamilyPolicy := v1.IPFamilyPolicyRequireDualStack
+				cfg.svc.Spec.IPFamilyPolicy = &ipFamilyPolicy
+				cfg.svc.Spec.IPFamilies = []v1.IPFamily{v1.IPv6Protocol, v1.IPv4Protocol}
+			},
+			hookPreTest: func(e2e *e2eTestConfig) {
+				framework.Logf("running hook pre-test: verify target group attributes are set correctly to AWS resource")
+
+				if e2e.svc.Status.LoadBalancer.Ingress[0].Hostname == "" && e2e.svc.Status.LoadBalancer.Ingress[0].IP == "" {
+					framework.Failf("LoadBalancer ingress is empty (no hostname or IP) for service %s/%s", e2e.svc.Namespace, e2e.svc.Name)
+				}
+
+				hostAddr := e2eservice.GetIngressPoint(&e2e.svc.Status.LoadBalancer.Ingress[0])
+				framework.Logf("Load balancer's ingress address: %s", hostAddr)
+
+				if hostAddr == "" {
+					framework.Failf("Unable to get LoadBalancer ingress address for service %s/%s", e2e.svc.Namespace, e2e.svc.Name)
+				}
+
+				elbClient, err := getAWSClientLoadBalancer(e2e.ctx)
+				framework.ExpectNoError(err, "failed to create AWS ELB client")
+
+				// DescribeLoadBalancers API doesn't support filtering by DNS name directly
+				// Use AWS SDK paginator to search through all load balancers
+				foundLB, err := getAWSLoadBalancerFromDNSName(e2e.ctx, elbClient, hostAddr)
+				framework.ExpectNoError(err, "failed to find load balancer with DNS name %s", hostAddr)
+				if foundLB == nil {
+					framework.Failf("Found load balancer is nil for DNS name %s", hostAddr)
+				}
+
+				lbARN := aws.ToString(foundLB.LoadBalancerArn)
+				if lbARN == "" {
+					framework.Failf("Load balancer ARN is empty for DNS name %s", hostAddr)
+				}
+				framework.Logf("Found load balancer: %s with ARN: %s", aws.ToString(foundLB.LoadBalancerName), lbARN)
+
+				// lookup target group ARN from load balancer ARN
+				targetGroups, err := elbClient.DescribeTargetGroups(e2e.ctx, &elbv2.DescribeTargetGroupsInput{
+					LoadBalancerArn: aws.String(lbARN),
+				})
+				framework.ExpectNoError(err, "failed to describe target groups")
+				gomega.Expect(len(targetGroups.TargetGroups)).To(gomega.Equal(1))
+
+				targetGroupAttributes, err := elbClient.DescribeTargetGroupAttributes(e2e.ctx, &elbv2.DescribeTargetGroupAttributesInput{
+					TargetGroupArn: aws.String(aws.ToString(targetGroups.TargetGroups[0].TargetGroupArn)),
+				})
+				framework.ExpectNoError(err, "failed to describe target group attributes")
+
+				// verify if the target group attributes are set correctly
+
+				annotationToDict := map[string]string{}
+				for _, v := range strings.Split(e2e.svc.Annotations[annotationLBTargetGroupAttributes], ",") {
+					parts := strings.Split(v, "=")
+					annotationToDict[parts[0]] = parts[1]
+				}
+				framework.Logf("TG attribute Annotation to dict: %v", annotationToDict)
+
+				framework.Logf("=== All Target Group Attributes from AWS ===")
+				for _, attr := range targetGroupAttributes.Attributes {
+					framework.Logf("  %s=%s", aws.ToString(attr.Key), aws.ToString(attr.Value))
+				}
+
+				framework.Logf("=== Expected Target Group Attributes from Annotation ===")
+				for key, value := range annotationToDict {
+					framework.Logf("  %s=%s", key, value)
+				}
+
+				// Check if our expected attributes are present and match
+				framework.Logf("=== Verifying Target Group Attributes ===")
+				for _, attr := range targetGroupAttributes.Attributes {
+					if expectedValue, ok := annotationToDict[aws.ToString(attr.Key)]; ok {
+						actualValue := aws.ToString(attr.Value)
+						framework.Logf("Checking attribute: %s", aws.ToString(attr.Key))
+						framework.Logf("  Expected: %s", expectedValue)
+						framework.Logf("  Actual:   %s", actualValue)
+
+						if actualValue != expectedValue {
+							framework.Failf("Target group attribute mismatch for %s: expected %s, got %s", aws.ToString(attr.Key), expectedValue, actualValue)
+						} else {
+							framework.Logf("  Target group attribute %s matches expected value %s", aws.ToString(attr.Key), expectedValue)
+						}
+					}
+				}
+			},
+		},
 	}
 
 	serviceNameBase := "lbconfig-test"
@@ -263,6 +371,9 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				e2e.nodeCount, e2e.nodeSelector, e2e.nodeSingleSample, e2e.hasIPv4Nodes, e2e.hasIPv6Nodes)
 			if tc.requiresIPv4 && !e2e.hasIPv4Nodes {
 				Skip(fmt.Sprintf("skipping %q: test requires IPv4 nodes, but none were found in the cluster", tc.name))
+			}
+			if tc.requiresDualStack && (!e2e.hasIPv4Nodes || !e2e.hasIPv6Nodes) {
+				Skip(fmt.Sprintf("skipping %q: test requires a dual-stack cluster, but the cluster does not have both IPv4 and IPv6 nodes", tc.name))
 			}
 
 			loadBalancerCreateTimeout := e2eservice.GetServiceLoadBalancerCreationTimeout(ctx, cs)
