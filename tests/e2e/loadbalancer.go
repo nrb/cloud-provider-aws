@@ -35,6 +35,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	elb "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancing"
 	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 )
@@ -143,6 +144,65 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			},
 			overrideTestRunInClusterReachableHTTP: true,
 			requireAffinity:                       true,
+			hookPreTest: func(cfg *e2eTestConfig) {
+				framework.Logf("running hook pre-test: verify CLB target instance is InService")
+
+				if len(cfg.svc.Status.LoadBalancer.Ingress) == 0 {
+					framework.Failf("LoadBalancer ingress is empty for service %s/%s", cfg.svc.Namespace, cfg.svc.Name)
+				}
+
+				hostAddr := e2eservice.GetIngressPoint(&cfg.svc.Status.LoadBalancer.Ingress[0])
+				if hostAddr == "" {
+					framework.Failf("Unable to get LoadBalancer ingress address for service %s/%s", cfg.svc.Namespace, cfg.svc.Name)
+				}
+				framework.Logf("Load balancer's ingress address: %s", hostAddr)
+
+				awsCfg, err := config.LoadDefaultConfig(cfg.ctx)
+				framework.ExpectNoError(err, "failed to load AWS config")
+				elbClient := elb.NewFromConfig(awsCfg)
+
+				// Find the CLB by DNS name by paginating through all classic load balancers.
+				var lbName string
+				paginator := elb.NewDescribeLoadBalancersPaginator(elbClient, &elb.DescribeLoadBalancersInput{})
+				for paginator.HasMorePages() {
+					page, errP := paginator.NextPage(cfg.ctx)
+					framework.ExpectNoError(errP, "failed to describe classic load balancers")
+					for _, lb := range page.LoadBalancerDescriptions {
+						if strings.EqualFold(aws.ToString(lb.DNSName), hostAddr) {
+							lbName = aws.ToString(lb.LoadBalancerName)
+							break
+						}
+					}
+					if lbName != "" {
+						break
+					}
+				}
+				if lbName == "" {
+					framework.Failf("No CLB found with DNS name %s", hostAddr)
+				}
+				framework.Logf("Found CLB: %s", lbName)
+
+				// Wait for at least one target instance to be InService before running the connectivity test.
+				framework.Logf("Waiting for CLB target instance to become InService...")
+				err = wait.PollImmediate(15*time.Second, 5*time.Minute, func() (bool, error) {
+					health, errH := elbClient.DescribeInstanceHealth(cfg.ctx, &elb.DescribeInstanceHealthInput{
+						LoadBalancerName: aws.String(lbName),
+					})
+					if errH != nil {
+						framework.Logf("Error describing instance health: %v", errH)
+						return false, nil
+					}
+					for _, state := range health.InstanceStates {
+						framework.Logf("Instance %s state: %s (reason: %s)", aws.ToString(state.InstanceId), aws.ToString(state.State), aws.ToString(state.ReasonCode))
+						if aws.ToString(state.State) == "InService" {
+							framework.Logf("CLB target instance %s is InService", aws.ToString(state.InstanceId))
+							return true, nil
+						}
+					}
+					return false, nil
+				})
+				framework.ExpectNoError(err, "CLB target instance did not become InService within timeout")
+			},
 		},
 		// Hairpining traffic test for NLB.
 		// The target type instance (default) sets the preserve client IP attribute to true,
